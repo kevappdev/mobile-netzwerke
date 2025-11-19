@@ -1,6 +1,10 @@
 package com.example.netzwerk_nav_app
 
 import android.content.Context
+import android.nfc.NdefMessage
+import android.nfc.NfcAdapter
+import android.nfc.Tag
+import android.nfc.tech.Ndef
 import android.os.Build
 import android.os.Bundle
 import android.telephony.*
@@ -17,6 +21,8 @@ import android.net.wifi.WifiManager
 
 class MainActivity : FlutterActivity() {
   private val CHANNEL = "com.example.netzwerk/nav"
+  private var nfcAdapter: NfcAdapter? = null
+  private var pendingNfcResult: MethodChannel.Result? = null
 
   override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
     super.configureFlutterEngine(flutterEngine)
@@ -52,6 +58,14 @@ class MainActivity : FlutterActivity() {
           } catch (t: Throwable) {
             result.success(hashMapOf("error" to ("ERROR: ${t.message}")))
           }
+        }
+        "isNfcAvailable" -> {
+          result.success(isNfcAvailable())
+        }
+        "startNfcScan" -> startNfcScan(result)
+        "stopNfcScan" -> {
+          stopNfcScan()
+          result.success(null)
         }
         else -> result.notImplemented()
       }
@@ -268,6 +282,120 @@ class MainActivity : FlutterActivity() {
     map["bandsSupported"] = bands
 
     return map
+  }
+
+  private fun isNfcAvailable(): Boolean {
+    val adapter = NfcAdapter.getDefaultAdapter(this)
+    return adapter?.isEnabled == true
+  }
+
+  @Synchronized
+  private fun startNfcScan(result: MethodChannel.Result) {
+    val adapter = NfcAdapter.getDefaultAdapter(this)
+    if (adapter == null) {
+      result.error("UNAVAILABLE", "NFC wird von diesem Gerät nicht unterstützt.", null)
+      return
+    }
+    if (!adapter.isEnabled) {
+      result.error("DISABLED", "NFC ist deaktiviert.", null)
+      return
+    }
+    if (pendingNfcResult != null) {
+      result.error("BUSY", "Es läuft bereits ein Scan.", null)
+      return
+    }
+    nfcAdapter = adapter
+    pendingNfcResult = result
+    runOnUiThread {
+      val flags =
+        NfcAdapter.FLAG_READER_NFC_A or
+        NfcAdapter.FLAG_READER_NFC_B or
+        NfcAdapter.FLAG_READER_NFC_F or
+        NfcAdapter.FLAG_READER_NFC_V or
+        NfcAdapter.FLAG_READER_NFC_BARCODE or
+        NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK
+      adapter.enableReaderMode(
+        this,
+        NfcAdapter.ReaderCallback { tag ->
+          val payload = serializeTag(tag)
+          runOnUiThread {
+            deliverNfcResult(payload)
+            disableReaderModeInternal()
+          }
+        },
+        flags,
+        Bundle().apply { putInt(NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY, 250) }
+      )
+    }
+  }
+
+  @Synchronized
+  private fun stopNfcScan() {
+    pendingNfcResult?.let {
+      it.error("CANCELED", "Scan abgebrochen.", null)
+      pendingNfcResult = null
+    }
+    disableReaderModeInternal()
+  }
+
+  @Synchronized
+  private fun deliverNfcResult(payload: HashMap<String, Any?>) {
+    pendingNfcResult?.success(payload)
+    pendingNfcResult = null
+  }
+
+  private fun disableReaderModeInternal() {
+    runOnUiThread {
+      try {
+        nfcAdapter?.disableReaderMode(this)
+      } catch (t: Throwable) {
+        Log.w("NFC", "disableReaderMode failed: ${t.message}")
+      }
+    }
+  }
+
+  private fun serializeTag(tag: Tag): HashMap<String, Any?> {
+    val data = hashMapOf<String, Any?>()
+    val idBytes = tag.id
+    if (idBytes != null && idBytes.isNotEmpty()) {
+      data["idBytes"] = idBytes.map { it.toInt() and 0xFF }
+      data["idHex"] = idBytes.joinToString(":") { String.format("%02X", it) }
+    }
+    data["techList"] = tag.techList?.toList()
+    data["timestamp"] = System.currentTimeMillis()
+
+    val ndef = Ndef.get(tag)
+    if (ndef != null) {
+      val ndefMap = hashMapOf<String, Any?>()
+      ndefMap["type"] = ndef.type
+      ndefMap["isWritable"] = safe { ndef.isWritable }
+      ndefMap["maxSize"] = safe { ndef.maxSize }
+      val message = safe { ndef.cachedNdefMessage ?: readNdefMessage(ndef) }
+      if (message != null) {
+        ndefMap["records"] = message.records.map { record ->
+          hashMapOf(
+            "tnf" to record.tnf.toInt(),
+            "type" to record.type?.map { it.toInt() and 0xFF },
+            "payload" to record.payload?.map { it.toInt() and 0xFF },
+            "id" to record.id?.map { it.toInt() and 0xFF }
+          )
+        }
+      }
+      data["ndef"] = ndefMap
+    }
+
+    return data
+  }
+
+  private fun readNdefMessage(ndef: Ndef): NdefMessage? {
+    return try {
+      ndef.connect()
+      ndef.ndefMessage
+    } catch (t: Throwable) {
+      null
+    } finally {
+      try { ndef.close() } catch (_: Throwable) {}
+    }
   }
 
   private fun bandFromFrequency(freqMHz: Int): String {
